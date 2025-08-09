@@ -1,594 +1,170 @@
 'use client';
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import FetchControls from "../components/controls/FetchControls";
+import ImportExportControls from "../components/controls/ImportExportControls";
+import OrdersTable from "../components/OrdersTable";
+import { classNames } from "../lib/utils/object";
+import { cacheOrdersToLocalStorage, loadOrdersFromLocalStorage, loadFlags, saveFlags } from "../lib/storage/ordersCache";
+import { buildOrdersQuery, fetchOrders as apiFetchOrders, normalizeOrders, getOrderId } from "../lib/api/orders";
+import { buildInvoicePayload, createInvoice, extractDownloadUrl, resolveUrl, deriveUrlFromId } from "../lib/api/invoices";
 
-// Single-file React app for Next.js page (app/page.jsx or pages/index.js)
-// Requires your Orders API on http://localhost:5000 and your Invoices API on http://localhost:8000 with CORS for http://localhost:3000.
-// Tailwind used for quick styling.
-
-const ORDERS_API_BASE = "http://localhost:5000";
-const INVOICES_API_BASE = "http://localhost:8000";
-
-// LocalStorage keys
-const LS_KEY = "amazon-orders-cache-v1"; // stores {orders, cachedAt, queryUrl}
-const LS_KEY_FLAGS = "amazon-orders-flags-v1"; // stores preferences (e.g., autoSaveJson)
-
-function classNames(...xs) {
-  return xs.filter(Boolean).join(" ");
-}
-
-function pick(obj, paths, fallback = undefined) {
-  for (const path of paths) {
-    const parts = path.split(".");
-    let v = obj;
-    for (const p of parts) {
-      if (v && typeof v === "object" && p in v) v = v[p];
-      else { v = undefined; break; }
-    }
-    if (v !== undefined && v !== null) return v;
-  }
-  return fallback;
-}
-
-function normalizeOrders(raw) {
-  // Try common containers; fallback to raw if it's already an array
-  const candidates = ["payload.Orders", "payload.orders", "Orders", "orders", "data", "items", "results"];
-  let arr = pick(raw, candidates, raw);
-  if (Array.isArray(arr)) return arr;
-  if (arr && typeof arr === "object") {
-    // Sometimes the API returns a single order object — make it an array
-    const maybe = pick(arr, ["Orders", "orders", "data", "items", "results"], []);
-    if (Array.isArray(maybe)) return maybe;
-    return [arr];
-  }
-  return [];
-}
-
-function orderKey(id) {
-  return String(id || "").trim();
-}
-
-function getOrderId(o) {
-  return pick(o, [
-    "AmazonOrderId", "amazonOrderId", "amazon_order_id",
-    "OrderId", "orderId", "order_id",
-    "id"
-  ], "");
-}
-
-function getPurchaseDate(o) {
-  return pick(o, [
-    "PurchaseDate", "purchaseDate", "purchase_date",
-    "LastUpdateDate", "lastUpdateDate", "last_update_date",
-    "CreatedAt", "created_at"
-  ], "");
-}
-
-function getOrderStatus(o) {
-  return pick(o, [
-    "OrderStatus", "orderStatus", "order_status",
-    "Status", "status"
-  ], "");
-}
-
-function getBuyerName(o) {
-  return pick(o, [
-    "BuyerInfo.BuyerName", "buyerInfo.buyerName",
-    "BuyerName", "buyerName",
-    "buyer_info.buyer_name",
-    "ShippingAddress.Name", "shippingAddress.name"
-  ], "");
-}
-
-
-function prettyDate(iso) {
-  if (!iso) return "";
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleString();
-  } catch {
-    return iso;
-  }
-}
-
-// ---- Persistence helpers ----
-function cacheOrdersToLocalStorage(orders, queryUrl) {
-  try {
-    const payload = { orders, cachedAt: new Date().toISOString(), queryUrl };
-    localStorage.setItem(LS_KEY, JSON.stringify(payload));
-  } catch { }
-}
-
-function loadOrdersFromLocalStorage() {
-  try {
-    const s = localStorage.getItem(LS_KEY);
-    if (!s) return null;
-    const obj = JSON.parse(s);
-    const list = normalizeOrders(obj?.orders ?? obj);
-    return { orders: list, cachedAt: obj?.cachedAt, queryUrl: obj?.queryUrl };
-  } catch {
-    return null;
-  }
-}
-
-function loadFlags() {
-  try {
-    const s = localStorage.getItem(LS_KEY_FLAGS);
-    if (!s) return {};
-    return JSON.parse(s) || {};
-  } catch {
-    return {};
-  }
-}
-
-function saveFlags(flags) {
-  try {
-    localStorage.setItem(LS_KEY_FLAGS, JSON.stringify(flags || {}));
-  } catch { }
-}
-
-// Trigger a JSON file download (used after a successful fetch, if enabled)
-function downloadOrdersJson(orders) {
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const blob = new Blob([JSON.stringify(orders, null, 2)], {
-    type: "application/json",
-  });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `amazon-orders-${stamp}.json`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-export default function AmazonOrdersApp() {
+export default function Page(){
+  // Data
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  // Query params
   const [allPages, setAllPages] = useState(false);
   const [maxPerPage, setMaxPerPage] = useState(10);
-  const [lastUpdatedAfter, setLastUpdatedAfter] = useState(
-    "2025-08-07T00:00:00Z"
-  );
+  const [lastUpdatedAfter, setLastUpdatedAfter] = useState("2025-08-07T00:00:00Z");
 
-  // 'usingCache' = we are showing data from localStorage or manual file import
+  // Cache state
   const [usingCache, setUsingCache] = useState(false);
-  const [cacheMeta, setCacheMeta] = useState(null); // {cachedAt, queryUrl, source: 'localStorage'|'file'}
+  const [cacheMeta, setCacheMeta] = useState(null);
 
   // Preferences
-  const [autoSaveJson, setAutoSaveJson] = useState(true);
+  const [autoSaveJson, setAutoSaveJson] = useState(false);
 
-  // orderId -> { status: 'idle'|'generating'|'ready'|'error', url?: string, data?: any, errMsg?: string }
-  const [invoiceMap, setInvoiceMap] = useState({});
+  // Invoice per-row state
+  const [invoiceMap, setInvoiceMap] = useState({}); // { [orderId]: { status: 'idle'|'generating'|'ready'|'error', url?, errMsg? } }
+  function orderKey(id){ return String(id || ""); }
+  function updateInvoiceState(id, patch){ setInvoiceMap((m) => ({ ...m, [orderKey(id)]: { ...(m[orderKey(id)] || {}), ...patch } })); }
 
   const fileInputRef = useRef(null);
 
-  useEffect(() => {
-    const f = loadFlags();
-    if (typeof f.autoSaveJson === "boolean") setAutoSaveJson(f.autoSaveJson);
-  }, []);
+  // Load preferences
+  useEffect(() => { const f = loadFlags(); if(typeof f.autoSaveJson === "boolean") setAutoSaveJson(f.autoSaveJson); }, []);
+  useEffect(() => { saveFlags({ autoSaveJson }); }, [autoSaveJson]);
 
-  useEffect(() => {
-    saveFlags({ autoSaveJson });
-  }, [autoSaveJson]);
+  const queryUrl = useMemo(() => buildOrdersQuery({ allPages, maxPerPage, lastUpdatedAfter }), [allPages, maxPerPage, lastUpdatedAfter]);
 
-  const queryUrl = useMemo(() => {
-    const u = new URL(`${ORDERS_API_BASE}/orders`);
-    u.searchParams.set("all_pages", String(allPages));
-    u.searchParams.set("max_per_page", String(maxPerPage || 10));
-    if (lastUpdatedAfter) u.searchParams.set("last_updated_after", lastUpdatedAfter);
-    return u.toString();
-  }, [allPages, maxPerPage, lastUpdatedAfter]);
-
-  async function fetchOrders() {
-    setLoading(true);
-    setError("");
-    setUsingCache(false);
-    setCacheMeta(null);
-    try {
-      const res = await fetch(queryUrl);
-      if (!res.ok) throw new Error(`GET /orders failed: ${res.status}`);
-      const json = await res.json();
-      const list = normalizeOrders(json);
+  async function doFetchOrders(){
+    setLoading(true); setError(""); setUsingCache(false); setCacheMeta(null);
+    try{
+      const list = await apiFetchOrders({ allPages, maxPerPage, lastUpdatedAfter });
       setOrders(list);
-
-      // Persist to localStorage for offline fallback
       cacheOrdersToLocalStorage(list, queryUrl);
-
-      // Also download a JSON snapshot if enabled
-      if (autoSaveJson) {
-        downloadOrdersJson(list);
-      }
-    } catch (e) {
+      if(autoSaveJson) triggerJsonDownload(list);
+    }catch(e){
       console.error(e);
       setError(e.message || String(e));
-
-      // Fallback to cached localStorage copy if available
-      const cached = loadOrdersFromLocalStorage();
-      if (cached?.orders?.length) {
-        setOrders(cached.orders);
-        setUsingCache(true);
-        setCacheMeta({ cachedAt: cached.cachedAt, queryUrl: cached.queryUrl, source: "localStorage" });
-      }
-    } finally {
+    }finally{
       setLoading(false);
     }
   }
 
-  useEffect(() => {
-    fetchOrders();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useEffect(() => { doFetchOrders(); /* initial load */ }, []);
 
   useEffect(() => {
-    try {
-      const cache = JSON.parse(localStorage.getItem('invoiceMap') || '{}');
-      if (cache && typeof cache === 'object') {
-        setInvoiceMap(cache);
-      }
-    } catch { }
-  }, []);
+    try{
+      const cache = JSON.parse(localStorage.getItem("amazon-orders-cache-v1") || "null");
+      if(cache?.orders?.length){ setCacheMeta({ cachedAt: cache.cachedAt, queryUrl: cache.queryUrl, source: "localStorage" }); }
+    }catch{}
+  }, [orders]);
 
-
-  function manualSaveNow() {
-    try {
-      downloadOrdersJson(orders);
-    } catch (e) {
-      alert("Failed to save file: " + (e.message || e));
-    }
+  function triggerJsonDownload(list){
+    try{
+      const blob = new Blob([JSON.stringify(list, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `amazon-orders-${new Date().toISOString().replaceAll(":","-")}.json`;
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    }catch{}
   }
 
-  function updateInvoiceState(orderId, patch) {
-    setInvoiceMap((prev) => ({ ...prev, [orderId]: { ...(prev[orderId] || {}), ...patch } }));
-  }
-
-  function extractDownloadUrl(data) {
-    const candidates = [
-      'download_link',                      // <= your API
-      'download_url', 'download_uri', 'pdf_url', 'file_url', 'invoice_url', 'url',
-      'data.download_link', 'data.download_url', 'data.download_uri',
-      'result.download_link', 'result.download_url', 'result.download_uri',
-      'payload.download_link', 'payload.download_url', 'payload.download_uri',
-      'invoice.download_link', 'invoice.download_url', 'invoice.download_uri',
-      'links.download', 'links.self',
-    ];
-    return pick(data, candidates, undefined);
-  }
-
-  function resolveUrl(u) {
-    if (!u) return undefined;
-    try {
-      return new URL(u, INVOICES_API_BASE).toString(); // supports “/download/…”
-    } catch {
-      return u;
-    }
-  }
-
-  // If API returns an id but not a URL, construct a reasonable default.
-  function deriveUrlFromId(data) {
-    const id = pick(data, ["invoice_id", "invoiceId", "id", "data.invoice_id", "payload.invoice_id"]);
-    if (!id) return undefined;
-    // Try your service’s canonical path here if different:
-    const candidates = [
-      `${INVOICES_API_BASE}/invoices/${id}/download`,
-      `${INVOICES_API_BASE}/invoices/${id}.pdf`,
-      `${INVOICES_API_BASE}/invoices/${id}?download=1`,
-      `${INVOICES_API_BASE}/invoices/${id}`,
-    ];
-    return candidates[0];
-  }
-
-
-  function resolveUrl(u) {
-    if (!u) return undefined;
-    try {
-      // supports relative paths like "/invoices/123.pdf"
-      return new URL(u, INVOICES_API_BASE).toString();
-    } catch {
-      return u; // if it's already absolute but URL() fails for some reason
-    }
-  }
-
-  function orderKey(id) {
-    return String(id || '').trim();
-  }
-
-  async function generateInvoice(order) {
-    const id = orderKey(getOrderId(order));
-    if (!id) return;
-
-    updateInvoiceState(id, { status: 'generating', url: undefined, errMsg: undefined });
-
-    try {
-      // Step 1: build payload (POST)
-      const step1 = await fetch(`${ORDERS_API_BASE}/orders/${id}/invoice`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order_id: id }),
-      });
-      if (!step1.ok) throw new Error(`POST /orders/${id}/invoice failed: ${step1.status}`);
-      const invoicePayload = await step1.json();
-
-      // Step 2: generate/store
-      const step2 = await fetch(`${INVOICES_API_BASE}/invoices`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(invoicePayload),
-      });
-      if (!step2.ok) throw new Error(`POST /invoices failed: ${step2.status}`);
-      const result = await step2.json();
-
-      const urlRaw = extractDownloadUrl(result) ?? extractDownloadUrl(invoicePayload);
+  async function generateInvoice(order){
+    const id = orderKey(getOrderId(order)); if(!id) return;
+    updateInvoiceState(id, { status: "generating", url: undefined, errMsg: undefined });
+    try{
+      const payload = await buildInvoicePayload(id);
+      const result = await createInvoice(payload);
+      const urlRaw = extractDownloadUrl(result) ?? extractDownloadUrl(payload) ?? deriveUrlFromId(result) ?? deriveUrlFromId(payload);
       const url = resolveUrl(urlRaw);
-
-      console.debug('Invoice result for', id, { result, urlRaw, url });
-      if (!url) {
-        throw new Error('No download URL found in response');
-      }
-
-      updateInvoiceState(id, { status: 'ready', url, data: result });
-      // Optional: persist so it survives reloads
-      try {
-        const cache = JSON.parse(localStorage.getItem('invoiceMap') || '{}');
-        cache[id] = { status: 'ready', url };
-        localStorage.setItem('invoiceMap', JSON.stringify(cache));
-      } catch { }
-    } catch (e) {
+      if(!url) throw new Error("No download link found in API response");
+      updateInvoiceState(id, { status: "ready", url });
+    }catch(e){
       console.error(e);
-      updateInvoiceState(id, { status: 'error', errMsg: e.message || String(e) });
+      updateInvoiceState(id, { status: "error", errMsg: e.message || String(e) });
       alert(`Invoice failed for ${id}: ${e.message || e}`);
     }
   }
 
+  function openInvoice(id){ /* placeholder for analytics if needed */ }
 
-  // Manual load from localStorage
-  function loadCached() {
-    const cached = loadOrdersFromLocalStorage();
-    if (cached?.orders?.length) {
-      setOrders(cached.orders);
-      setUsingCache(true);
-      setCacheMeta({ cachedAt: cached.cachedAt, queryUrl: cached.queryUrl, source: "localStorage" });
-      setError("");
-    } else {
-      alert("No cached orders found in this browser.");
-    }
-  }
-
-  // Manual load from a user-selected JSON file
-  function onChooseFile() {
-    fileInputRef.current?.click();
-  }
-  function onFilePicked(e) {
-    const f = e.target.files?.[0];
-    if (!f) return;
+  function onImportFile(e){
+    const f = e.target.files?.[0]; if(!f) return;
     const reader = new FileReader();
     reader.onload = () => {
-      try {
-        const obj = JSON.parse(reader.result);
-        const list = normalizeOrders(obj);
-        if (!Array.isArray(list)) throw new Error("Invalid orders format in file.");
-        setOrders(list);
-        setUsingCache(true);
-        setCacheMeta({ cachedAt: new Date().toISOString(), queryUrl: "(from file)", source: "file" });
-        setError("");
-
-        // Also store into localStorage for future offline use
+      try{
+        const json = JSON.parse(reader.result);
+        const list = normalizeOrders(json);
+        setOrders(list); setUsingCache(true); setCacheMeta({ cachedAt: new Date().toISOString(), queryUrl: "(file)", source: "file" });
+        // persist as cache too
         cacheOrdersToLocalStorage(list, "(from file)");
-      } catch (err) {
+      }catch(err){
         alert("Failed to read JSON: " + (err.message || err));
       }
     };
     reader.readAsText(f);
-    // Reset the input so same file can be selected again later
     e.target.value = "";
   }
 
-  function OrdersTable() {
-    if (!orders?.length && !loading) {
-      return (
-        <div className="text-sm text-gray-600">No orders yet. Try adjusting filters and click <b>Fetch Orders</b>, or <button onClick={loadCached} className="underline">load cached</button>.</div>
-      );
-    }
-
-    return (
-      <div className="overflow-x-auto border rounded-xl">
-        <table className="min-w-full text-sm">
-          <thead className="bg-gray-50">
-            <tr>
-              <th className="px-4 py-2 text-left font-semibold">Amazon Order ID</th>
-              <th className="px-4 py-2 text-left font-semibold">Purchase Date</th>
-              <th className="px-4 py-2 text-left font-semibold">Status</th>
-              <th className="px-4 py-2 text-left font-semibold">Buyer</th>
-              <th className="px-4 py-2 text-left font-semibold">Invoice</th>
-            </tr>
-          </thead>
-          <tbody>
-            {orders.map((o, idx) => {
-              const id = orderKey(getOrderId(o));
-              const inv = invoiceMap[id];
-              return (
-                 <tr key={id || idx} className={classNames(idx % 2 ? "bg-white" : "bg-gray-50")}>
-                  <td className="px-4 py-2 font-mono">{id || "—"}</td>
-                  <td className="px-4 py-2">{prettyDate(getPurchaseDate(o))}</td>
-                  <td className="px-4 py-2">
-                    <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs">
-                      {getOrderStatus(o) || "—"}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2">{getBuyerName(o) || "—"}</td>
-                  <td className="px-4 py-2">
-                    <div className="flex items-center gap-2">
-                      {inv?.status === 'ready' && inv?.url ? (
-                        <a
-                          href={inv.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center rounded-lg border px-3 py-1 text-xs hover:bg-gray-100"
-                        >
-                          Download invoice
-                        </a>
-                      ) : (
-                        <button
-                          onClick={() => generateInvoice(o)}
-                          disabled={inv?.status === 'generating'}
-                          className={classNames(
-                            'inline-flex items-center rounded-lg bg-black text-white px-3 py-1 text-xs',
-                            inv?.status === 'generating' && 'opacity-60 cursor-wait'
-                          )}
-                        >
-                          {inv?.status === 'generating' ? 'Generating…' : 'Generate Invoice'}
-                        </button>
-                      )}
-                      {inv?.status === 'error' && <span className="text-xs text-red-600">Failed</span>}
-                    </div>
-                  </td>
-                </tr>
-              );
-            })}
-
-          </tbody>
-        </table>
-      </div>
-    );
-  }
+  function manualSaveNow(){ if(!orders?.length) return; triggerJsonDownload(orders); }
+  function loadCached(){ const cached = loadOrdersFromLocalStorage(); if(cached?.orders?.length){ setOrders(cached.orders); setUsingCache(true); setCacheMeta({ cachedAt: cached.cachedAt, queryUrl: cached.queryUrl, source: "localStorage" }); } }
 
   return (
-    <div className="min-h-screen bg-gray-100">
-      <div className="max-w-6xl mx-auto p-6 space-y-6">
-        <header className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold">Amazon Orders & Invoices</h1>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={fetchOrders}
-              className={classNames(
-                "rounded-lg bg-black text-white px-4 py-2",
-                loading && "opacity-60 cursor-wait"
-              )}
-              disabled={loading}
-            >
-              {loading ? "Fetching…" : "Fetch Orders"}
-            </button>
-            <button
-              onClick={manualSaveNow}
-              className="rounded-lg border px-4 py-2 disabled:opacity-50"
-              disabled={!orders?.length}
-              title={!orders?.length ? "No orders to save yet" : ""}
-            >
-              Save Orders JSON
-            </button>
-            <button
-              onClick={loadCached}
-              className="rounded-lg border px-4 py-2"
-              title="Load cached orders from this browser"
-            >
-              Load Cached
-            </button>
-            <button
-              onClick={onChooseFile}
-              className="rounded-lg border px-4 py-2"
-              title="Load from a saved JSON file"
-            >
-              Load From File…
-            </button>
-            <input
-              type="file"
-              accept="application/json"
-              className="hidden"
-              ref={fileInputRef}
-              onChange={onFilePicked}
-            />
-          </div>
-        </header>
-
-        <section className="bg-white border rounded-xl p-4">
-          <h2 className="font-semibold mb-3">Filters</h2>
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
-            <label className="flex flex-col text-sm">
-              <span className="text-gray-600 mb-1">Last Updated After (ISO)</span>
-              <input
-                className="border rounded-lg px-3 py-2"
-                placeholder="YYYY-MM-DDTHH:mm:ssZ"
-                value={lastUpdatedAfter}
-                onChange={(e) => setLastUpdatedAfter(e.target.value)}
-              />
-            </label>
-
-            <label className="flex flex-col text-sm">
-              <span className="text-gray-600 mb-1">Max Per Page</span>
-              <input
-                type="number"
-                min={1}
-                className="border rounded-lg px-3 py-2"
-                value={maxPerPage}
-                onChange={(e) => setMaxPerPage(parseInt(e.target.value || "10", 10))}
-              />
-            </label>
-
-            <label className="flex items-center gap-2 text-sm mt-6 md:mt-0">
-              <input
-                type="checkbox"
-                checked={allPages}
-                onChange={(e) => setAllPages(e.target.checked)}
-              />
-              <span>Fetch all pages</span>
-            </label>
-
-            <label className="flex items-center gap-2 text-sm mt-6 md:mt-0">
-              <input
-                type="checkbox"
-                checked={autoSaveJson}
-                onChange={(e) => setAutoSaveJson(e.target.checked)}
-              />
-              <span>Auto‑save JSON on fetch</span>
-            </label>
-
-            <div className="flex items-end">
-              <button
-                onClick={fetchOrders}
-                className={classNames(
-                  "w-full md:w-auto rounded-lg bg-black text-white px-4 py-2",
-                  loading && "opacity-60 cursor-wait"
-                )}
-                disabled={loading}
-              >
-                {loading ? "Fetching…" : "Apply & Fetch"}
-              </button>
-            </div>
-          </div>
-
-          <p className="text-xs text-gray-500 mt-2">
-            Target URL: <span className="font-mono">{queryUrl}</span>
-          </p>
-        </section>
-
-        {(usingCache || error) && (
-          <div className="border border-yellow-200 bg-yellow-50 text-yellow-800 px-4 py-3 rounded-xl">
-            {usingCache ? (
-              <div>
-                <strong>Offline cache in use.</strong>{" "}
-                <span className="text-xs">
-                  {cacheMeta?.source === "file"
-                    ? "Loaded from a local JSON file."
-                    : "Loaded from browser storage."}{" "}
-                  {cacheMeta?.cachedAt && <> Cached at {prettyDate(cacheMeta.cachedAt)}.</>}{" "}
-                  {cacheMeta?.queryUrl && <> Source: <span className="font-mono">{cacheMeta.queryUrl}</span></>}
-                </span>
-              </div>
-            ) : (
-              <div>
-                <strong>Fetch error:</strong> {error}
-              </div>
-            )}
+    <div className="max-w-6xl mx-auto px-4 py-8 space-y-8">
+      <header className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">Amazon Orders</h1>
+          <p className="text-gray-600 text-sm">Simple UI for viewing orders and generating invoices</p>
+        </div>
+        {cacheMeta && (
+          <div className="text-xs text-gray-500">
+            Showing {usingCache ? "cached" : "live"} data; cached at {cacheMeta.cachedAt}.<br/>
+            Source: {cacheMeta.source} ({cacheMeta.queryUrl})
           </div>
         )}
+      </header>
 
-        <section>
-          <OrdersTable />
-        </section>
-      </div>
+      <section className="space-y-4">
+        <div className="flex flex-wrap gap-3 items-center">
+          <FetchControls
+            loading={loading}
+            fetchOrders={doFetchOrders}
+            allPages={allPages} setAllPages={setAllPages}
+            maxPerPage={maxPerPage} setMaxPerPage={setMaxPerPage}
+            lastUpdatedAfter={lastUpdatedAfter} setLastUpdatedAfter={setLastUpdatedAfter}
+          />
+          <div className="flex-1" />
+          <ImportExportControls
+            orders={orders}
+            autoSaveJson={autoSaveJson}
+            setAutoSaveJson={setAutoSaveJson}
+            onImport={onImportFile}
+            onSaveNow={manualSaveNow}
+            fileInputRef={fileInputRef}
+          />
+        </div>
+        {error && (
+          <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+            <strong>Fetch error:</strong> {error}
+          </div>
+        )}
+      </section>
+
+      <section>
+        <OrdersTable
+          orders={orders}
+          invoiceMap={invoiceMap}
+          onGenerate={generateInvoice}
+          onOpen={openInvoice}
+          onLoadCached={loadCached}
+          loading={loading}
+        />
+      </section>
     </div>
   );
 }

@@ -1,27 +1,50 @@
-# Amazon Orders UI (Next.js + Tailwind, JS)
+# Amazon Orders UI — Modularized
 
-## Quick start
-```bash
-cd amazon-orders-ui
-pnpm install   # or npm install / yarn
-pnpm dev       # http://localhost:3000
+This is a modular refactor of your Next.js app so it’s easier to maintain and extend.
+
+## What changed
+- Split the **monolithic** `app/page.jsx` into **reusable components**, **API helpers**, **storage** and **utility** modules.
+- Added environment-based config: set `NEXT_PUBLIC_ORDERS_API_BASE` and `NEXT_PUBLIC_INVOICES_API_BASE` (with sensible localhost defaults).
+- Fixed/centralized invoice download link resolution. If your API returns any of `download_link`, `download_url`, etc., or just an `invoice_id`, the UI now builds a proper download URL and swaps the button to **Download Invoice** reliably.
+
+## Project structure
+```
+app/
+  globals.css
+  layout.js
+  page.jsx                # Thin container that wires everything together
+components/
+  OrdersTable.jsx
+  controls/
+    FetchControls.jsx
+    ImportExportControls.jsx
+lib/
+  constants.js            # API bases + LS keys (uses NEXT_PUBLIC_* env vars)
+  api/
+    orders.js             # GET /orders helpers + field selectors
+    invoices.js           # Build payload + create invoice + link resolvers
+  storage/
+    ordersCache.js        # localStorage helpers
+  utils/
+    object.js             # classNames, get, pick
+    format.js             # formatIso
+public/
+  robots.txt
 ```
 
-Make sure your FastAPI server runs at `http://localhost:5000` with CORS allowing `http://localhost:3000`.
-
-### FastAPI CORS example
-```py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+## Env vars
+Create a `.env.local` (Next.js) with:
+```
+NEXT_PUBLIC_ORDERS_API_BASE=http://localhost:5000
+NEXT_PUBLIC_INVOICES_API_BASE=http://localhost:8000
 ```
 
-You can change the API by editing the `API_BASE` constant inside `app/page.jsx`.
+## Scripts
+```
+npm install
+npm run dev   # http://localhost:3000
+```
+
+## Notes
+- The **Generate → Download** state is tracked per order in `invoiceMap` so it won’t flicker back after success.
+- If you change your invoice service’s download route, update `deriveUrlFromId()` in `lib/api/invoices.js`.
