@@ -16,16 +16,13 @@ function classNames(...xs) {
   return xs.filter(Boolean).join(" ");
 }
 
-function pick(obj, keys, fallback = undefined) {
-  for (const k of keys) {
-    const parts = k.split(".");
+function pick(obj, paths, fallback = undefined) {
+  for (const path of paths) {
+    const parts = path.split(".");
     let v = obj;
     for (const p of parts) {
       if (v && typeof v === "object" && p in v) v = v[p];
-      else {
-        v = undefined;
-        break;
-      }
+      else { v = undefined; break; }
     }
     if (v !== undefined && v !== null) return v;
   }
@@ -33,41 +30,55 @@ function pick(obj, keys, fallback = undefined) {
 }
 
 function normalizeOrders(raw) {
-  // Accepts multiple shapes: {payload: {Orders: [...]}} or {Orders:[...]} or {orders:[...]} or just [...]
-  if (Array.isArray(raw)) return raw;
-  const arr =
-    pick(raw, ["payload.Orders", "payload.orders", "Orders", "orders"], []) || [];
-  return Array.isArray(arr) ? arr : [];
+  // Try common containers; fallback to raw if it's already an array
+  const candidates = ["payload.Orders", "payload.orders", "Orders", "orders", "data", "items", "results"];
+  let arr = pick(raw, candidates, raw);
+  if (Array.isArray(arr)) return arr;
+  if (arr && typeof arr === "object") {
+    // Sometimes the API returns a single order object — make it an array
+    const maybe = pick(arr, ["Orders", "orders", "data", "items", "results"], []);
+    if (Array.isArray(maybe)) return maybe;
+    return [arr];
+  }
+  return [];
+}
+
+function orderKey(id) {
+  return String(id || "").trim();
 }
 
 function getOrderId(o) {
-  return (
-    o?.AmazonOrderId || o?.amazonOrderId || o?.orderId || o?.order_id || o?.id || ""
-  );
+  return pick(o, [
+    "AmazonOrderId", "amazonOrderId", "amazon_order_id",
+    "OrderId", "orderId", "order_id",
+    "id"
+  ], "");
 }
 
 function getPurchaseDate(o) {
-  return (
-    o?.PurchaseDate || o?.purchaseDate || o?.purchase_date || o?.CreatedAt || ""
-  );
+  return pick(o, [
+    "PurchaseDate", "purchaseDate", "purchase_date",
+    "LastUpdateDate", "lastUpdateDate", "last_update_date",
+    "CreatedAt", "created_at"
+  ], "");
 }
 
 function getOrderStatus(o) {
-  return (
-    o?.OrderStatus || o?.orderStatus || o?.order_status || o?.Status || o?.status || ""
-  );
+  return pick(o, [
+    "OrderStatus", "orderStatus", "order_status",
+    "Status", "status"
+  ], "");
 }
 
 function getBuyerName(o) {
-  return (
-    pick(o, [
-      "BuyerInfo.BuyerName",
-      "buyerInfo.buyerName",
-      "BuyerName",
-      "buyerName",
-    ]) || ""
-  );
+  return pick(o, [
+    "BuyerInfo.BuyerName", "buyerInfo.buyerName",
+    "BuyerName", "buyerName",
+    "buyer_info.buyer_name",
+    "ShippingAddress.Name", "shippingAddress.name"
+  ], "");
 }
+
 
 function prettyDate(iso) {
   if (!iso) return "";
@@ -212,6 +223,16 @@ export default function AmazonOrdersApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    try {
+      const cache = JSON.parse(localStorage.getItem('invoiceMap') || '{}');
+      if (cache && typeof cache === 'object') {
+        setInvoiceMap(cache);
+      }
+    } catch { }
+  }, []);
+
+
   function manualSaveNow() {
     try {
       downloadOrdersJson(orders);
@@ -226,21 +247,13 @@ export default function AmazonOrdersApp() {
 
   function extractDownloadUrl(data) {
     const candidates = [
-      // your API:
-      "download_link",
-
-      // common alternates:
-      "download_url", "download_uri", "pdf_url", "file_url", "invoice_url", "url",
-
-      // nested variants:
-      "data.download_link",
-      "data.download_url", "data.download_uri",
-      "result.download_link",
-      "result.download_url", "result.download_uri",
-      "payload.download_link",
-      "payload.download_url", "payload.download_uri",
-      "invoice.download_link", "invoice.download_url", "invoice.download_uri",
-      "links.download", "links.self",
+      'download_link',                      // <= your API
+      'download_url', 'download_uri', 'pdf_url', 'file_url', 'invoice_url', 'url',
+      'data.download_link', 'data.download_url', 'data.download_uri',
+      'result.download_link', 'result.download_url', 'result.download_uri',
+      'payload.download_link', 'payload.download_url', 'payload.download_uri',
+      'invoice.download_link', 'invoice.download_url', 'invoice.download_uri',
+      'links.download', 'links.self',
     ];
     return pick(data, candidates, undefined);
   }
@@ -248,17 +261,10 @@ export default function AmazonOrdersApp() {
   function resolveUrl(u) {
     if (!u) return undefined;
     try {
-      // supports relative paths like "/download/ea59e4...bca57"
-      return new URL(u, INVOICES_API_BASE).toString();
+      return new URL(u, INVOICES_API_BASE).toString(); // supports “/download/…”
     } catch {
       return u;
     }
-  }
-
-
-  function resolveUrl(u) {
-    if (!u) return undefined;
-    try { return new URL(u, INVOICES_API_BASE).toString(); } catch { return u; }
   }
 
   // If API returns an id but not a URL, construct a reasonable default.
@@ -286,44 +292,57 @@ export default function AmazonOrdersApp() {
     }
   }
 
+  function orderKey(id) {
+    return String(id || '').trim();
+  }
+
   async function generateInvoice(order) {
-    const orderId = getOrderId(order);
-    if (!orderId) return;
-    updateInvoiceState(orderId, { status: "generating", url: undefined, errMsg: undefined });
+    const id = orderKey(getOrderId(order));
+    if (!id) return;
+
+    updateInvoiceState(id, { status: 'generating', url: undefined, errMsg: undefined });
 
     try {
-      // 1) Build invoice payload for this order (POST instead of GET)
-      const step1 = await fetch(`${ORDERS_API_BASE}/orders/${orderId}/invoice`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // If your API doesn't need any fields, you can send {} or omit body entirely.
-        body: JSON.stringify({ order_id: orderId })
+      // Step 1: build payload (POST)
+      const step1 = await fetch(`${ORDERS_API_BASE}/orders/${id}/invoice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order_id: id }),
       });
-      if (!step1.ok) throw new Error(`POST /orders/${orderId}/invoice failed: ${step1.status}`);
+      if (!step1.ok) throw new Error(`POST /orders/${id}/invoice failed: ${step1.status}`);
       const invoicePayload = await step1.json();
 
-      // 2) POST to /invoices to actually generate & store it
+      // Step 2: generate/store
       const step2 = await fetch(`${INVOICES_API_BASE}/invoices`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(invoicePayload),
       });
       if (!step2.ok) throw new Error(`POST /invoices failed: ${step2.status}`);
       const result = await step2.json();
 
-      const urlRaw =
-        extractDownloadUrl(result) ??
-        extractDownloadUrl(invoicePayload); // fallback if builder step returned it
-
+      const urlRaw = extractDownloadUrl(result) ?? extractDownloadUrl(invoicePayload);
       const url = resolveUrl(urlRaw);
-      updateInvoiceState(orderId, { status: "ready", url, data: result });
 
+      console.debug('Invoice result for', id, { result, urlRaw, url });
+      if (!url) {
+        throw new Error('No download URL found in response');
+      }
+
+      updateInvoiceState(id, { status: 'ready', url, data: result });
+      // Optional: persist so it survives reloads
+      try {
+        const cache = JSON.parse(localStorage.getItem('invoiceMap') || '{}');
+        cache[id] = { status: 'ready', url };
+        localStorage.setItem('invoiceMap', JSON.stringify(cache));
+      } catch { }
     } catch (e) {
       console.error(e);
-      updateInvoiceState(orderId, { status: "error", errMsg: e.message || String(e) });
-      alert(`Invoice failed for ${orderId}: ${e.message || e}`);
+      updateInvoiceState(id, { status: 'error', errMsg: e.message || String(e) });
+      alert(`Invoice failed for ${id}: ${e.message || e}`);
     }
   }
+
 
   // Manual load from localStorage
   function loadCached() {
@@ -388,11 +407,11 @@ export default function AmazonOrdersApp() {
           </thead>
           <tbody>
             {orders.map((o, idx) => {
-              const orderId = getOrderId(o);
-              const inv = invoiceMap[orderId];
+              const id = orderKey(getOrderId(o));
+              const inv = invoiceMap[id];
               return (
-                <tr key={orderId || idx} className={classNames(idx % 2 ? "bg-white" : "bg-gray-50")}>
-                  <td className="px-4 py-2 font-mono">{orderId || "—"}</td>
+                 <tr key={id || idx} className={classNames(idx % 2 ? "bg-white" : "bg-gray-50")}>
+                  <td className="px-4 py-2 font-mono">{id || "—"}</td>
                   <td className="px-4 py-2">{prettyDate(getPurchaseDate(o))}</td>
                   <td className="px-4 py-2">
                     <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs">
@@ -402,7 +421,7 @@ export default function AmazonOrdersApp() {
                   <td className="px-4 py-2">{getBuyerName(o) || "—"}</td>
                   <td className="px-4 py-2">
                     <div className="flex items-center gap-2">
-                      {inv?.status === "ready" && inv?.url ? (
+                      {inv?.status === 'ready' && inv?.url ? (
                         <a
                           href={inv.url}
                           target="_blank"
@@ -414,24 +433,22 @@ export default function AmazonOrdersApp() {
                       ) : (
                         <button
                           onClick={() => generateInvoice(o)}
-                          disabled={inv?.status === "generating"}
+                          disabled={inv?.status === 'generating'}
                           className={classNames(
-                            "inline-flex items-center rounded-lg bg-black text-white px-3 py-1 text-xs",
-                            inv?.status === "generating" && "opacity-60 cursor-wait"
+                            'inline-flex items-center rounded-lg bg-black text-white px-3 py-1 text-xs',
+                            inv?.status === 'generating' && 'opacity-60 cursor-wait'
                           )}
                         >
-                          {inv?.status === "generating" ? "Generating…" : "Generate Invoice"}
+                          {inv?.status === 'generating' ? 'Generating…' : 'Generate Invoice'}
                         </button>
                       )}
-                      {inv?.status === "error" && (
-                        <span className="text-xs text-red-600">Failed</span>
-                      )}
+                      {inv?.status === 'error' && <span className="text-xs text-red-600">Failed</span>}
                     </div>
                   </td>
-
                 </tr>
               );
             })}
+
           </tbody>
         </table>
       </div>
